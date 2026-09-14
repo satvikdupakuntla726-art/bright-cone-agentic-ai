@@ -25,26 +25,19 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Safe Dynamic Production CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:\d+|http://127\.0\.0\.1:\d+",
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
 # Authentication routes if present
 if HAS_AUTH_ROUTER:
     app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
-
-# Safe Production CORS
-# Safe Production CORS
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://frontend-rr8w.vercel.app",
-    os.getenv("FRONTEND_URL", "https://bright-cone-frontend.vercel.app"),
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 @app.on_event("startup")
 async def startup_event():
