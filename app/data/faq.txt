@@ -1,0 +1,3 @@
+Billing Policy: If a customer is charged twice in a single month, verify the duplicate transaction ID and issue a full refund for the second charge immediately.
+Password Reset: To reset a password, send a recovery link to the registered email address.
+Account Deletion: Account deletion requests must be escalated to a human agent.
