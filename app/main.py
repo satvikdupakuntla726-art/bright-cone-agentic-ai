@@ -30,10 +30,12 @@ if HAS_AUTH_ROUTER:
     app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
 
 # Safe Production CORS
+# Safe Production CORS
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    os.getenv("FRONTEND_URL", "https://bright-cone-frontend.vercel.app")
+    "https://frontend-rr8w.vercel.app",
+    os.getenv("FRONTEND_URL", "https://bright-cone-frontend.vercel.app"),
 ]
 
 app.add_middleware(
