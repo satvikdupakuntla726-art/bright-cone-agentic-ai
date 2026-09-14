@@ -193,3 +193,4 @@ yarl==1.24.5
 youtube-transcript-api==1.2.4
 zstandard==0.25.0
 pymongo
+mongomock
