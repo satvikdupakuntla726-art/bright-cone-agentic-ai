@@ -1,44 +1,41 @@
 import os
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from app.database import tickets_collection, get_db
 from app.agents.ticket_agents import run_full_pipeline
 from app.services.rag_service import initialize_chroma_db
-
-# Graceful Auth Import
-try:
-    from app.auth import get_current_user, router as auth_router
-    HAS_AUTH_ROUTER = True
-except Exception:
-    HAS_AUTH_ROUTER = False
+from app.auth import get_current_user, router as auth_router
+from app.models.schemas import ProcessTicketRequest
 
 load_dotenv()
 
 app = FastAPI(
     title="BrightCone Agentic AI Resolution System",
-    version="1.0.0"
+    version="1.1.0",
+    description="Multi-agent customer support orchestration and compliance command center."
 )
 
-# Authentication routes if present
-if HAS_AUTH_ROUTER:
-    app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
+# Mount authentication router
+app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
 
-# Safe Production CORS
+# Safe Production and Local CORS
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:8002",
+    "http://127.0.0.1:8002",
     os.getenv("FRONTEND_URL", "https://bright-cone-frontend.vercel.app")
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:\d+|http://127\.0\.0\.1:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -61,12 +58,10 @@ def health_check():
         "environment": "production-ready"
     }
 
-class ProcessTicketRequest(BaseModel):
-    user_id: str
-    query: str
-
 @app.post("/api/process-ticket")
-def process_ticket(payload: ProcessTicketRequest):
+def process_ticket(payload: ProcessTicketRequest, current_user: str | None = Depends(get_current_user)):
+    ticket_id = f"TCK-{str(uuid.uuid4())[:8].upper()}"
+    raw_output = ""
     try:
         raw_output = run_full_pipeline(payload.user_id, payload.query)
         
@@ -82,15 +77,12 @@ def process_ticket(payload: ProcessTicketRequest):
 
         parsed_data = json.loads(cleaned)
 
-        # Generate ticket identifier
-        ticket_id = f"TCK-{str(uuid.uuid4())[:8].upper()}"
-
         ticket_doc = {
             "ticket_id": ticket_id,
             "id": ticket_id,
             "user_id": payload.user_id,
             "query": payload.query,
-            "status": parsed_data.get("escalation_status", "Requires More Information"),
+            "status": parsed_data.get("escalation_status", "Resolved"),
             "category": parsed_data.get("issue_category", "General"),
             "priority": parsed_data.get("priority", "Medium"),
             "recommended_actions": parsed_data.get("recommended_actions", []),
@@ -98,9 +90,8 @@ def process_ticket(payload: ProcessTicketRequest):
             "blocked_actions": parsed_data.get("blocked_actions", []),
             "agent_execution_history": parsed_data.get("agent_execution_history", []),
             "final_response": parsed_data.get("final_response", ""),
-            "full_crewai_output": parsed_data,
             "details": parsed_data,
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.now(timezone.utc).isoformat()
         }
 
         # Persist document to MongoDB
@@ -112,11 +103,30 @@ def process_ticket(payload: ProcessTicketRequest):
             "details": parsed_data
         }
 
-    except json.JSONDecodeError:
-        return {
+    except json.JSONDecodeError as decode_err:
+        print(f"[Main Notice] JSON format warning: {decode_err}")
+        # Always persist the escalated ticket with valid ticket_id so frontend tracking never breaks
+        fallback_doc = {
+            "ticket_id": ticket_id,
+            "id": ticket_id,
+            "user_id": payload.user_id,
+            "query": payload.query,
             "status": "Escalated",
-            "message": "Reviewer format validation failed. Handed over to human desk.",
-            "raw_output": raw_output
+            "category": "General",
+            "priority": "High",
+            "recommended_actions": ["Escalated to human supervisor for manual triage."],
+            "actions_performed": ["Automated reviewer format validation fallback triggered."],
+            "blocked_actions": [],
+            "agent_execution_history": ["Reviewer format fallback: handed over to human desk."],
+            "final_response": "Your support request has been registered and escalated to our human service desk for prioritized review.",
+            "details": {"raw_output": raw_output},
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        tickets_collection.insert_one(fallback_doc)
+        return {
+            "ticket_id": ticket_id,
+            "status": "Escalated",
+            "details": fallback_doc
         }
     except Exception as exc:
         raise HTTPException(
@@ -126,9 +136,19 @@ def process_ticket(payload: ProcessTicketRequest):
 
 @app.get("/api/tickets")
 def list_tickets():
-    # Exclude MongoDB internal _id for JSON serialization
-    tickets = list(tickets_collection.find({}, {"_id": 0}))
+    # Exclude MongoDB internal _id and sort by newest first
+    tickets = list(tickets_collection.find({}, {"_id": 0}).sort("created_at", -1))
     return tickets
+
+@app.get("/api/tickets/{ticket_id}")
+def get_ticket(ticket_id: str):
+    ticket = tickets_collection.find_one(
+        {"$or": [{"ticket_id": ticket_id}, {"id": ticket_id}]},
+        {"_id": 0}
+    )
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return ticket
 
 @app.get("/api/analytics")
 def get_analytics():

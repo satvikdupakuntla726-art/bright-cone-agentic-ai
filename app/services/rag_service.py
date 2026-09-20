@@ -1,8 +1,11 @@
+import os
 import chromadb
 from chromadb.utils import embedding_functions
 
-# Initialize persistent/in-memory chroma client
-chroma_client = chromadb.Client()
+# Initialize persistent chroma client targeting local chroma_db directory
+CHROMA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "chroma_db")
+os.makedirs(CHROMA_DIR, exist_ok=True)
+chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
 
 # Embedding function default
 emb_fn = embedding_functions.DefaultEmbeddingFunction()
@@ -40,52 +43,64 @@ ENTERPRISE_DOCS = [
     }
 ]
 
-# Seed documents if empty
-if collection.count() == 0:
-    collection.add(
-        ids=[d["id"] for d in ENTERPRISE_DOCS],
-        documents=[d["doc"] for d in ENTERPRISE_DOCS]
-    )
+def _load_faq_docs():
+    """Load additional FAQ entries from app/data/faq.txt if available."""
+    docs = []
+    faq_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "faq.txt")
+    if os.path.exists(faq_path):
+        try:
+            with open(faq_path, "r", encoding="utf-8") as f:
+                for idx, line in enumerate(f, start=1):
+                    clean_line = line.strip()
+                    if clean_line:
+                        docs.append({
+                            "id": f"faq_{idx}",
+                            "doc": clean_line
+                        })
+        except Exception as e:
+            print(f"[RAG Notice] Could not read faq.txt: {e}")
+    return docs
 
-def query_support_kb(query_text: str, n_results: int = 2) -> dict:
-    results = collection.query(
-        query_texts=[query_text],
-        n_results=n_results
-    )
-    if results and results.get("documents") and results["documents"][0]:
-        retrieved_texts = results["documents"][0]
-        matched_ids = results["ids"][0]
-        return {
-            "matched_ids": matched_ids,
-            "context": " | ".join(retrieved_texts)
-        }
+def initialize_chroma_db():
+    """Startup initialization helper to seed documents from enterprise policies and faq.txt."""
+    all_docs = ENTERPRISE_DOCS + _load_faq_docs()
+    existing_ids = set(collection.get()["ids"]) if collection.count() > 0 else set()
+    
+    new_docs = [d for d in all_docs if d["id"] not in existing_ids]
+    if new_docs:
+        collection.add(
+            ids=[d["id"] for d in new_docs],
+            documents=[d["doc"] for d in new_docs]
+        )
+    return True
+
+# Initialize on module load
+try:
+    initialize_chroma_db()
+except Exception as err:
+    print(f"[RAG Notice] Seeding warning: {err}")
+
+def query_knowledge_base(query_text: str, n_results: int = 2) -> dict:
+    """Query ChromaDB vector store for relevant enterprise documentation."""
+    try:
+        results = collection.query(
+            query_texts=[query_text],
+            n_results=min(n_results, max(1, collection.count()))
+        )
+        if results and results.get("documents") and results["documents"][0]:
+            retrieved_texts = results["documents"][0]
+            matched_ids = results["ids"][0]
+            return {
+                "matched_ids": matched_ids,
+                "context": " | ".join(retrieved_texts)
+            }
+    except Exception as e:
+        print(f"[RAG Notice] Query error: {e}")
+        
     return {
         "matched_ids": [],
         "context": "No matching enterprise knowledge base documentation found."
     }
-def query_knowledge_base(query_text: str, n_results: int = 2):
-    # If your function was named query_support_kb or similar, call it here:
-    if "query_support_kb" in globals():
-        return query_support_kb(query_text, n_results)
-    
-    results = collection.query(
-        query_texts=[query_text],
-        n_results=n_results
-    )
-    if results and results.get("documents") and results["documents"][0]:
-        return {
-            "matched_ids": results["ids"][0],
-            "context": " | ".join(results["documents"][0])
-        }
-    return {
-        "matched_ids": [],
-        "context": "No matching knowledge base documentation found."
-    }
-def initialize_chroma_db():
-    """Startup initialization helper to verify or seed the collection."""
-    if collection.count() == 0:
-        collection.add(
-            ids=[d["id"] for d in ENTERPRISE_DOCS],
-            documents=[d["doc"] for d in ENTERPRISE_DOCS]
-        )
-    return True
+
+# Backward compatibility alias
+query_support_kb = query_knowledge_base

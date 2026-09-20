@@ -2,6 +2,7 @@ import os
 import json
 import re
 import warnings
+from datetime import datetime, timezone
 from typing import Any
 from crewai import Agent, Task, Crew
 from crewai.llms.base_llm import BaseLLM
@@ -11,6 +12,14 @@ from dotenv import load_dotenv
 
 from app.services.rag_service import query_knowledge_base
 from app.services.memory_service import get_conversation_history, add_message_to_memory
+from app.agents.tools import (
+    reset_password_tool,
+    fetch_invoice_tool,
+    issue_refund_tool,
+    get_customer,
+    get_billing_history,
+    request_refund
+)
 
 # Suppress SDK warnings to keep terminal logs clean
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -27,14 +36,14 @@ class LangChainGeminiLLM(BaseLLM):
     CrewAI BaseLLM-compliant adapter utilizing LangChain's ChatGoogleGenerativeAI.
     Features:
     - Bypasses LiteLLM v1beta 404 NOT_FOUND errors.
-    - Zero-wait Quota & Rate Limit Auto-Rotation (rotates between models with max_retries=0).
+    - Zero-wait Quota & Rate Limit Auto-Rotation across active Gemini models.
     """
     _model_pool: list[str] = PrivateAttr(default_factory=lambda: [
         "gemini-3.5-flash",
-        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
         "gemini-flash-latest",
-        "gemini-3.5-flash-lite",
-        "gemini-2.5-flash"
+        "gemini-1.5-flash"
     ])
     _current_index: int = PrivateAttr(default=0)
     _active_llm: Any = PrivateAttr(default=None)
@@ -100,7 +109,7 @@ class LangChainGeminiLLM(BaseLLM):
     async def acall(self, messages: Any, **kwargs) -> str:
         return self.call(messages, **kwargs)
 
-# Instantiate singleton LLM pipeline
+# Singleton LLM adapter
 gemini_llm = LangChainGeminiLLM(
     model="gemini-3.5-flash",
     temperature=0.1
@@ -109,66 +118,79 @@ gemini_llm = LangChainGeminiLLM(
 MOCK_CUSTOMERS = {
     "test_1": {"name": "Test User", "plan": "Enterprise", "is_vip": True, "sentiment": "Neutral"},
     "user123": {"name": "Alex Smith", "plan": "Enterprise", "is_vip": True, "sentiment": "Neutral"},
-    "user456": {"name": "Sarah Connor", "plan": "Free", "is_vip": False, "sentiment": "Neutral"}
+    "user456": {"name": "Sarah Connor", "plan": "Free", "is_vip": False, "sentiment": "Neutral"},
+    "test_enterprise_1": {"name": "Enterprise Lead", "plan": "Enterprise", "is_vip": True, "sentiment": "Neutral"},
+    "user_sec_42": {"name": "Sec Operator", "plan": "Pro", "is_vip": False, "sentiment": "Neutral"},
+    "dev_enterprise_8": {"name": "Dev Integrator", "plan": "Enterprise", "is_vip": True, "sentiment": "Neutral"}
 }
-
-# 1. Triage Agent
-triage_agent = Agent(
-    role="Triage Specialist",
-    goal="Diagnose the customer issue category (Billing, Technical, Account) and priority level (Low, Medium, High).",
-    backstory="Senior triage engineer trained to categorize customer inquiries accurately.",
-    verbose=False,
-    llm=gemini_llm
-)
-
-# 2. Context Agent
-context_agent = Agent(
-    role="Customer Context Specialist",
-    goal="Determine customer tier, VIP privilege, and prior conversational context.",
-    backstory="Account specialist ensuring responses match customer contract level and history.",
-    verbose=False,
-    llm=gemini_llm
-)
-
-# 3. Knowledge / RAG Agent
-rag_agent = Agent(
-    role="Knowledge Retrieval Specialist",
-    goal="Extract and synthesize authoritative company policy and documentation.",
-    backstory="Retrieval specialist operating across internal documentation and vector stores.",
-    verbose=False,
-    llm=gemini_llm
-)
-
-# 4. Resolution Agent
-resolution_agent = Agent(
-    role="Solutions Specialist",
-    goal="Formulate actionable resolution steps and recommend safe operations.",
-    backstory="Customer support engineer formulating clear answers and necessary actions.",
-    verbose=False,
-    llm=gemini_llm
-)
-
-# 5. Escalation & Guardrail Agent
-escalation_agent = Agent(
-    role="Escalation & Guardrail Specialist",
-    goal="Enforce compliance guardrails conditionally: strictly block automated refunds while resolving safe requests.",
-    backstory="Compliance auditor. You enforce financial guardrails ONLY when monetary transactions, refunds, or charges are requested. Safe non-financial tasks are cleared as Resolved with no blocked actions.",
-    verbose=False,
-    llm=gemini_llm
-)
-
-# 6. Reviewer Agent
-reviewer_agent = Agent(
-    role="Reviewer & Quality Auditor",
-    goal="Perform final validation of all steps and return strict, raw, parseable JSON matching the required conditional schema.",
-    backstory="Final gatekeeper ensuring JSON formatting standards and conditional guardrail accuracy.",
-    verbose=False,
-    llm=gemini_llm
-)
 
 MONETARY_KEYWORDS = [
     "refund", "money", "charged", "chargeback", "rebate", "credit", "fee", "dispute", "billing adjustment", "financial deduction"
 ]
+
+def create_support_agents(llm: BaseLLM):
+    """
+    Factory function instantiating fresh, thread-isolated CrewAI agents per request.
+    Prevents race conditions, cross-user context contamination, and execution history state leaks.
+    """
+    # 1. Triage Agent
+    triage = Agent(
+        role="Triage Specialist",
+        goal="Diagnose the customer issue category (Billing, Technical, Account) and priority level (Low, Medium, High).",
+        backstory="Senior triage engineer trained to categorize customer inquiries accurately.",
+        verbose=False,
+        llm=llm
+    )
+
+    # 2. Context Agent
+    context = Agent(
+        role="Customer Context Specialist",
+        goal="Determine customer tier, VIP privilege, and prior conversational context.",
+        backstory="Account specialist ensuring responses match customer contract level and history.",
+        verbose=False,
+        tools=[get_customer],
+        llm=llm
+    )
+
+    # 3. Knowledge / RAG Agent
+    rag = Agent(
+        role="Knowledge Retrieval Specialist",
+        goal="Extract and synthesize authoritative company policy and documentation.",
+        backstory="Retrieval specialist operating across internal documentation and vector stores.",
+        verbose=False,
+        llm=llm
+    )
+
+    # 4. Resolution Agent
+    resolution = Agent(
+        role="Solutions Specialist",
+        goal="Formulate actionable resolution steps and recommend safe operations.",
+        backstory="Customer support engineer formulating clear answers and safe necessary actions.",
+        verbose=False,
+        tools=[reset_password_tool, fetch_invoice_tool, get_billing_history],
+        llm=llm
+    )
+
+    # 5. Escalation & Guardrail Agent
+    escalation = Agent(
+        role="Escalation & Guardrail Specialist",
+        goal="Enforce compliance guardrails conditionally: strictly block automated refunds while resolving safe requests.",
+        backstory="Compliance auditor. You enforce financial guardrails ONLY when monetary transactions, refunds, or charges are actively requested. Safe non-financial tasks or general policy questions are cleared as Resolved with no blocked actions.",
+        verbose=False,
+        tools=[issue_refund_tool, request_refund],
+        llm=llm
+    )
+
+    # 6. Reviewer Agent
+    reviewer = Agent(
+        role="Reviewer & Quality Auditor",
+        goal="Perform final validation of all steps and return strict, raw, parseable JSON matching the required conditional schema.",
+        backstory="Final gatekeeper ensuring JSON formatting standards and conditional guardrail accuracy.",
+        verbose=False,
+        llm=llm
+    )
+
+    return triage, context, rag, resolution, escalation, reviewer
 
 def run_full_pipeline(user_id: str, query: str) -> str:
     """Executes the 6-agent sequential CrewAI pipeline with strictly conditional guardrail enforcement."""
@@ -191,11 +213,18 @@ def run_full_pipeline(user_id: str, query: str) -> str:
 
     cust_data = MOCK_CUSTOMERS.get(user_id, {"name": "Valued User", "plan": "Standard", "is_vip": False})
     query_lower = query.lower()
-    is_monetary_query = any(k in query_lower for k in MONETARY_KEYWORDS)
+    
+    # Differentiate active monetary refund demands from general policy inquiries
+    is_policy_inquiry = any(term in query_lower for term in ["policy", "what is", "how do", "can you explain", "documentation", "terms", "rules"])
+    has_monetary_keyword = any(k in query_lower for k in MONETARY_KEYWORDS)
+    is_monetary_query = has_monetary_keyword and not is_policy_inquiry
+
+    # Instantiate isolated agents per request
+    triage_agent, context_agent, rag_agent, resolution_agent, escalation_agent, reviewer_agent = create_support_agents(gemini_llm)
 
     # Task 1: Triage
     triage_task = Task(
-        description=f"Analyze incoming query: '{query}'. Classify category (Billing/Technical/Account) and priority (Low/Medium/High).",
+        description=f"Analyze incoming query: {json.dumps(query)}. Classify category (Billing/Technical/Account) and priority (Low/Medium/High).",
         expected_output="JSON with 'issue_category' and 'priority'.",
         agent=triage_agent
     )
@@ -227,16 +256,16 @@ def run_full_pipeline(user_id: str, query: str) -> str:
     # Task 5: Escalation & Guardrail Verification (Strictly Conditional)
     escalation_task = Task(
         description=f"""Audit the customer inquiry and resolution plan for compliance and risk:
-        User Query: '{query}'
+        User Query: {json.dumps(query)}
 
         STRICT CONDITIONAL GUARDRAIL RULES:
-        - RULE 1 (MONETARY / REFUND REQUESTS):
-          IF AND ONLY IF the user query or resolution explicitly involves money, refunds, duplicate charges, or billing adjustments:
+        - RULE 1 (MONETARY / ACTIVE REFUND REQUESTS):
+          IF AND ONLY IF the user query actively demands refunds, duplicate charge credits, or billing adjustments:
             * Set escalation_status to 'Escalated'
             * Add 'Refund API: BLOCKED (HUMAN APPROVAL REQUIRED)' to blocked_actions.
         
-        - RULE 2 (NORMAL / GENERAL REQUESTS):
-          IF the query is a normal non-monetary inquiry (e.g. password reset, 2FA setup, general information, API documentation, account settings):
+        - RULE 2 (NORMAL / GENERAL REQUESTS OR POLICY INQUIRIES):
+          IF the query is a normal inquiry (e.g. password reset, general policy information, rate limits, account settings):
             * Set escalation_status to 'Resolved'
             * blocked_actions MUST BE AN EMPTY ARRAY [] (DO NOT block anything for normal queries).
         """,
@@ -245,29 +274,26 @@ def run_full_pipeline(user_id: str, query: str) -> str:
         context=[resolution_task]
     )
 
-    # Task 6: Final Reviewer Output (Strictly Conditional Schema)
-    escaped_query = query.replace('"', '\\"')
-    escaped_docs = docs_context.replace('"', '\\"')
-
     expected_status = "Escalated" if is_monetary_query else "Resolved"
     expected_blocked_str = '["Refund API: BLOCKED (HUMAN APPROVAL REQUIRED)"]' if is_monetary_query else '[]'
 
+    # Task 6: Final Reviewer Output (Strictly Conditional Schema)
     review_task = Task(
         description=f"""Compile the final production JSON response. 
         You MUST return ONLY a valid, raw parseable JSON object. Do NOT wrap in ```json or markdown code blocks.
         
         CONDITIONAL ENFORCEMENT RULES:
-        User Query: '{query}'
-        Is Monetary/Refund Query: {is_monetary_query}
-        - If monetary/refund: "escalation_status" MUST be "Escalated", and "blocked_actions" MUST contain "Refund API: BLOCKED (HUMAN APPROVAL REQUIRED)".
-        - If normal query (e.g., password reset, info): "escalation_status" MUST be "Resolved", and "blocked_actions" MUST be [] (empty array).
+        User Query: {json.dumps(query)}
+        Is Monetary/Refund Execution Query: {is_monetary_query}
+        - If active refund/monetary request: "escalation_status" MUST be "Escalated", and "blocked_actions" MUST contain "Refund API: BLOCKED (HUMAN APPROVAL REQUIRED)".
+        - If normal query or policy inquiry: "escalation_status" MUST be "Resolved", and "blocked_actions" MUST be [].
         
         JSON Schema:
         {{
-          "customer_query": "{escaped_query}",
+          "customer_query": {json.dumps(query)},
           "issue_category": "Billing OR Technical OR Account",
           "priority": "High OR Medium OR Low",
-          "retrieved_knowledge": "{escaped_docs}",
+          "retrieved_knowledge": {json.dumps(docs_context[:300])},
           "suggested_resolution": "...",
           "recommended_actions": ["..."],
           "actions_performed": ["..."],
@@ -288,7 +314,7 @@ def run_full_pipeline(user_id: str, query: str) -> str:
         context=[triage_task, context_task, rag_task, resolution_task, escalation_task]
     )
 
-    # Sequential Crew Execution
+    # Sequential Crew Execution with fresh isolated crew
     crew = Crew(
         agents=[triage_agent, context_agent, rag_agent, resolution_agent, escalation_agent, reviewer_agent],
         tasks=[triage_task, context_task, rag_task, resolution_task, escalation_task, review_task],
@@ -322,9 +348,9 @@ def run_full_pipeline(user_id: str, query: str) -> str:
         print(f"[Pipeline Notice] Resilient fallback engaged: {pipeline_err}")
         data = {
             "customer_query": query,
-            "issue_category": "Billing" if is_monetary_query else ("Account" if "password" in query_lower else "General"),
+            "issue_category": "Billing" if has_monetary_keyword else ("Account" if "password" in query_lower else "General"),
             "priority": "High" if is_monetary_query else "Medium",
-            "retrieved_knowledge": docs_context,
+            "retrieved_knowledge": docs_context[:300],
             "suggested_resolution": (
                 "Automated financial refunds are strictly prohibited without human Level-2 approval. "
                 "The inquiry has been audited against internal policy and escalated to the human financial desk."
@@ -365,7 +391,7 @@ def run_full_pipeline(user_id: str, query: str) -> str:
 
     # Deterministic Guardrail Verification
     if is_monetary_query:
-        # Rule 1: Monetary request -> Escalated with blocked action
+        # Rule 1: Active refund/monetary request -> Escalated with blocked action
         data["escalation_status"] = "Escalated"
         blocked = data.get("blocked_actions", [])
         if not isinstance(blocked, list):
@@ -374,15 +400,15 @@ def run_full_pipeline(user_id: str, query: str) -> str:
         if guardrail_msg not in blocked:
             blocked.append(guardrail_msg)
         data["blocked_actions"] = blocked
-    else:
-        # Rule 2: Normal request -> Resolved with empty blocked_actions
+    elif is_policy_inquiry or not has_monetary_keyword:
+        # Rule 2: Policy inquiry or safe non-monetary request -> Resolved with empty blocked_actions
         data["escalation_status"] = "Resolved"
         data["blocked_actions"] = []
 
-    # Save turn to Redis conversation memory
+    # Save turn to Redis conversation memory with clean text
     try:
         add_message_to_memory(user_id, "user", query)
-        add_message_to_memory(user_id, "assistant", json.dumps(data))
+        add_message_to_memory(user_id, "assistant", data.get("final_response", ""))
     except Exception:
         pass
 
